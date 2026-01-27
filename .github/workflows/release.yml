@@ -1,0 +1,220 @@
+name: Build and Release WCDB Apple XCFramework
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: "Build only without creating releases"
+        required: false
+        type: boolean
+        default: false
+      wcdb_version:
+        description: "WCDB version tag (e.g., 2.1.15)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  DEFAULT_WCDB_VERSION: 2.1.15
+
+jobs:
+  prepare:
+    runs-on: macos-15
+    outputs:
+      wcdb_version: ${{ steps.version.outputs.wcdb_version }}
+      clone_tag: ${{ steps.version.outputs.clone_tag }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      storage_release_tag: ${{ steps.version.outputs.storage_release_tag }}
+      skip_release: ${{ github.event.inputs.skip_release || 'false' }}
+    steps:
+      - name: Determine Version
+        id: version
+        run: |
+          RAW_WCDB_VERSION="${{ github.event.inputs.wcdb_version }}"
+          [ -z "$RAW_WCDB_VERSION" ] && RAW_WCDB_VERSION="${{ env.DEFAULT_WCDB_VERSION }}"
+          WCDB_VERSION="${RAW_WCDB_VERSION#v}"
+          CLONE_TAG="v$WCDB_VERSION"
+          echo "wcdb_version=$WCDB_VERSION" >> $GITHUB_OUTPUT
+          echo "clone_tag=$CLONE_TAG" >> $GITHUB_OUTPUT
+          echo "release_tag=$WCDB_VERSION" >> $GITHUB_OUTPUT
+          echo "storage_release_tag=storage.$WCDB_VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          [
+            ios,
+            ios-simulator,
+            macos,
+            macos-catalyst,
+            tvos,
+            tvos-simulator,
+            watchos,
+            watchos-simulator,
+          ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          brew install xcbeautify
+
+      - name: Clone WCDB
+        run: |
+          git clone --depth 1 --branch "${{ needs.prepare.outputs.clone_tag }}" \
+            https://github.com/Tencent/wcdb.git wcdb
+          cd wcdb && git submodule update --init --recursive --depth 1
+
+      - name: Build ${{ matrix.platform }}
+        run: |
+          ./Script/build-platform.sh wcdb WCDBSwift ${{ matrix.platform }} build/archives
+          ./Script/build-platform.sh wcdb WCDBObjc ${{ matrix.platform }} build/archives
+
+      - name: Pack artifacts with tar (preserve symlinks)
+        run: tar -cvf build-${{ matrix.platform }}.tar -C build/archives .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}
+          path: build-${{ matrix.platform }}.tar
+          retention-days: 1
+
+  merge-and-release:
+    needs: [prepare, build]
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./build/tarballs
+          merge-multiple: true
+
+      - name: Unpack tar artifacts (restore symlinks)
+        run: |
+          mkdir -p ./build/archives
+          for tarball in ./build/tarballs/*.tar; do
+            echo "Extracting $tarball..."
+            tar -xvf "$tarball" -C ./build/archives
+          done
+
+      - name: List artifacts
+        run: |
+          echo "=== Checking symlinks ==="
+          find ./build/archives -type l | head -20
+          echo "=== Listing xcarchives ==="
+          find ./build/archives -type d -name "*.xcarchive" | head -20
+
+      - name: Clone WCDB for LICENSE
+        run: |
+          git clone --depth 1 --branch "${{ needs.prepare.outputs.clone_tag }}" \
+            https://github.com/Tencent/wcdb.git wcdb
+          cp wcdb/LICENSE WCDB-LICENSE
+
+      - name: Merge XCFrameworks
+        run: ./Script/merge-xcframework.sh ./build/archives ./build/xcframeworks
+
+      - name: Zip XCFrameworks
+        run: |
+          cd build/xcframeworks
+          for scheme in WCDBSwift WCDBObjc; do
+            cp ${{ github.workspace }}/WCDB-LICENSE $scheme.xcframework/LICENSE
+            echo "=== Checking symlinks in $scheme.xcframework ==="
+            find $scheme.xcframework -type l
+            ditto -c -k --sequesterRsrc --keepParent $scheme.xcframework $scheme.xcframework.zip
+            echo "=== Verifying zip contents ==="
+            ditto -x -k $scheme.xcframework.zip /tmp/verify-$scheme
+            find /tmp/verify-$scheme -type l
+          done
+
+      - name: Upload XCFrameworks (skip_release mode)
+        if: needs.prepare.outputs.skip_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcdb-xcframeworks
+          path: ./build/xcframeworks/*.zip
+          retention-days: 7
+
+      - name: Remove existing Storage Release
+        if: needs.prepare.outputs.skip_release != 'true'
+        continue-on-error: true
+        run: git push origin --delete tag ${{ needs.prepare.outputs.storage_release_tag }} || true
+
+      - name: Publish Storage Release
+        if: needs.prepare.outputs.skip_release != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.storage_release_tag }}
+          files: ./build/xcframeworks/*.zip
+          body: |
+            ## Prebuilt WCDB binary for SPM
+            WCDB Version: ${{ needs.prepare.outputs.wcdb_version }}
+
+      - name: Build Package.swift
+        if: needs.prepare.outputs.skip_release != 'true'
+        run: |
+          TAG="${{ needs.prepare.outputs.storage_release_tag }}"
+          REPO="${{ github.repository }}"
+
+          WCDBSwift_URL="https://github.com/$REPO/releases/download/$TAG/WCDBSwift.xcframework.zip"
+          WCDBSwift_CHECKSUM=$(shasum -a 256 ./build/xcframeworks/WCDBSwift.xcframework.zip | awk '{print $1}')
+
+          WCDBObjc_URL="https://github.com/$REPO/releases/download/$TAG/WCDBObjc.xcframework.zip"
+          WCDBObjc_CHECKSUM=$(shasum -a 256 ./build/xcframeworks/WCDBObjc.xcframework.zip | awk '{print $1}')
+
+          sed -e "s|__WCDBSwift_DOWNLOAD_URL__|$WCDBSwift_URL|g" \
+              -e "s|__WCDBSwift_CHECKSUM__|$WCDBSwift_CHECKSUM|g" \
+              -e "s|__WCDBObjc_DOWNLOAD_URL__|$WCDBObjc_URL|g" \
+              -e "s|__WCDBObjc_CHECKSUM__|$WCDBObjc_CHECKSUM|g" \
+              Package.swift.template > Package.swift
+
+      - name: Validate SwiftPM
+        if: needs.prepare.outputs.skip_release != 'true'
+        run: swift package resolve
+
+      - name: Commit & Push
+        if: needs.prepare.outputs.skip_release != 'true'
+        uses: actions-js/push@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+          message: "Update Package.swift for ${{ needs.prepare.outputs.wcdb_version }}"
+
+      - name: Remove existing Release tag
+        if: needs.prepare.outputs.skip_release != 'true'
+        continue-on-error: true
+        run: git push origin --delete tag ${{ needs.prepare.outputs.release_tag }} || true
+
+      - name: Pull & Create Final Release
+        if: needs.prepare.outputs.skip_release != 'true'
+        run: |
+          git fetch origin main && git checkout main && git pull origin main
+          echo "RELEASE_TAG_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Create Final Release
+        if: needs.prepare.outputs.skip_release != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          target_commitish: ${{ env.RELEASE_TAG_COMMIT }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          body: |
+            ## WCDB Apple Package
+            WCDB Version: ${{ needs.prepare.outputs.wcdb_version }}
+            Package.swift updated automatically

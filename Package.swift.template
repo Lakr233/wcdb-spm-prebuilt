@@ -1,0 +1,31 @@
+// swift-tools-version:6.0
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import PackageDescription
+
+let package = Package(
+    name: "wcdb-spm-prebuilt",
+    platforms: [
+        .iOS(.v12),
+        .watchOS(.v5),
+        .tvOS(.v12),
+        .macOS(.v10_13),
+        .macCatalyst(.v13),
+    ],
+    products: [
+        .library(name: "WCDBSwift", targets: ["WCDBSwift"]),
+        .library(name: "WCDBObjc", targets: ["WCDBObjc"]),
+    ],
+    targets: [
+        .binaryTarget(
+            name: "WCDBSwift",
+            url: "__WCDBSwift_DOWNLOAD_URL__",
+            checksum: "__WCDBSwift_CHECKSUM__"
+        ),
+        .binaryTarget(
+            name: "WCDBObjc",
+            url: "__WCDBObjc_DOWNLOAD_URL__",
+            checksum: "__WCDBObjc_CHECKSUM__"
+        ),
+    ]
+)
